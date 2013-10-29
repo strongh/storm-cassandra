@@ -1,6 +1,8 @@
 package com.hmsonline.storm.cassandra.trident;
 
 import java.io.Serializable;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.InvocationTargetException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
@@ -33,6 +35,8 @@ import com.google.common.base.Function;
 import com.google.common.collect.Collections2;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Maps;
+import com.google.common.primitives.Primitives;
+
 import com.hmsonline.storm.cassandra.StormCassandraConstants;
 import com.netflix.astyanax.AstyanaxConfiguration;
 import com.netflix.astyanax.AstyanaxContext;
@@ -117,13 +121,13 @@ public class CassandraMapState<T> implements IBackingMap<T> {
     public static class Options<T> implements Serializable {
 
         public Serializer<T> serializer = null;
-        public int localCacheSize = 5000;
+        public String cachedMapClassName = "storm.trident.state.map.CachedMap";
+        public int localCacheOption = 1000;
         public String globalKey = "globalkey";
         public String columnFamily = "cassandra_state";
         public String columnName = "default_cassandra_state";
         public String clientConfigKey = "cassandra.config";
         public Integer ttl = 86400; // 1 day
-
     }
 
     @SuppressWarnings("rawtypes")
@@ -179,8 +183,41 @@ public class CassandraMapState<T> implements IBackingMap<T> {
         @SuppressWarnings({ "rawtypes", "unchecked" })
         public State makeState(Map conf, IMetricsContext metrics, int partitionIndex, int numPartitions) {
             CassandraMapState state = new CassandraMapState(options, conf);
+            Class mapClass;
+            try {
+                mapClass = Class.forName(this.options.cachedMapClassName);
+            } catch (ClassNotFoundException e) {
+                throw new RuntimeException("Cache map class not found.", e);
+            }
 
-            CachedMap cachedMap = new CachedMap(state, options.localCacheSize);
+            Object op = this.options.localCacheOption;
+            IBackingMap cachedMap;
+
+            // what we do here is not pretty.
+            // for the Class#getConstructor calls below, the parameter types _must_ match exactly
+            // i.e. the do not perform boxing/widening/coercion for matching signatures.
+            // this causes issues for primitive types in the signatures of constructors
+            // (e.g. in the default CachedMap, which uses int).
+            // so if the type of the option is a wrapper
+            // we unwrap it, and try to find constructors with either signature
+            Class opClass = op.getClass();
+
+            if (Primitives.isWrapperType(opClass)) {
+                opClass = Primitives.unwrap(opClass);
+            }
+
+            try {
+                Constructor<IBackingMap> c = mapClass.getConstructor(IBackingMap.class, opClass);
+                cachedMap = c.newInstance(state, op);
+            }
+            catch (Exception e) {
+                try {
+                    Constructor<IBackingMap> c = mapClass.getConstructor(IBackingMap.class, op.getClass());
+                    cachedMap = c.newInstance(state, op);
+                } catch (Exception e2) {
+                    throw new RuntimeException("Couldn't construct cache map.", e2);
+                }
+            }
 
             MapState mapState;
             if (stateType == StateType.NON_TRANSACTIONAL) {
